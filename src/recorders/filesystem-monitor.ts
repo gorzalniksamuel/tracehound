@@ -43,10 +43,16 @@ export class FilesystemMonitor {
         "**/Applications/**", // Ignore Applications
         "**/System/**",   // Ignore macOS System
         "**/Developer/**", // Ignore Developer tools
-        "**/node_modules/**", // Already in list but ensure it's there
+        "**/Group Containers/**", // Ignore Group Containers
+        "**/GroupContainersAlias/**", // Ignore GroupContainersAlias
+        "**/Application Support/**", // Ignore Application Support
+        "**/*.socket",    // Ignore socket files
+        "**/*.spice",     // Ignore spice files
+        "**/*Socket*",    // Ignore anything with Socket in name
       ],
       persistent: true,
       ignoreInitial: true,
+      depth: 1,  // Only watch 1 level deep to avoid too many files
       awaitWriteFinish: {
         stabilityThreshold: 300,
         pollInterval: 100,
@@ -56,8 +62,9 @@ export class FilesystemMonitor {
 
     // Handle errors silently
     this.watcher.on("error", (error: any) => {
-      // Silently ignore permission errors (EACCES, EPERM)
-      if (error.code === "EACCES" || error.code === "EPERM") return;
+      // Silently ignore permission errors (EACCES, EPERM, EMFILE, UNKNOWN)
+      const ignoredCodes = ["EACCES", "EPERM", "EMFILE", "UNKNOWN"];
+      if (ignoredCodes.includes(error.code)) return;
       console.error("File watcher error:", error);
     });
 
