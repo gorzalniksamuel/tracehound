@@ -33,7 +33,7 @@
     "developer-tools"
   ],
   "author": "Samuel Gorzalnik <gorzalniksamuel@gmail.com>",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/gorzalniksamuel/tracehound.git"
@@ -46,7 +46,8 @@
     "node": ">=18.0.0"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/chokidar": "^1.7.5",
+    "@types/node": "^20.19.40",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
     "eslint": "^8.57.0",
@@ -56,8 +57,10 @@
     "vitest": "^1.5.0"
   },
   "dependencies": {
-    "commander": "^12.0.0",
     "chalk": "^5.3.0",
+    "chokidar": "^5.0.0",
+    "commander": "^12.0.0",
+    "nanoid": "^5.1.11",
     "ora": "^8.0.0",
     "yaml": "^2.4.0",
     "zod": "^3.23.0"

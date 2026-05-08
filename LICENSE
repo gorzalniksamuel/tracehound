@@ -1,21 +1,118 @@
-MIT License
+# PolyForm Noncommercial License 1.0.0
 
-Copyright (c) 2025 Samuel Gorzalnik
+<https://polyformproject.org/licenses/noncommercial/1.0.0>
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+## Acceptance
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+In order to get any license under these terms, you must agree
+to them as both strict obligations and conditions to all
+your licenses.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+## Copyright License
+
+The licensor grants you a copyright license for the software
+to do everything you might do with the software that would
+otherwise infringe the licensor's copyright, except
+limitations described below.
+
+## Noncommercial Purposes
+
+Any noncommercial purpose is a permitted purpose.
+
+## Commercial Purposes
+
+Any commercial purpose is a **separate purpose** from
+noncommercial purposes. A separate purpose requires a
+separate agreement with the licensor.
+
+Commercial purposes include any use of the software that
+primarily aims at or results in:
+
+* **commercial advantage** or **private monetary compensation**
+* **advertising or marketing** for commercial products or services
+* use in any product or service sold, licensed, or provided for a fee
+* use to provide **software as a service** or **platform as a service**
+* use in research or development for a commercial product or service
+
+Noncommercial purposes include:
+
+* personal use, study, or hobby projects
+* **teaching and academic research** at educational institutions
+* **government use** by government agencies and departments
+* use by **registered charities and non-profit organizations**
+* use in **open source projects** that are themselves noncommercial
+* **journalism and news reporting**
+
+## Personal Uses
+
+Personal use for research, experiment, and testing for
+the benefit of public knowledge, personal study, private
+entertainment, hobby projects, amateur pursuits, or religious
+observance, without any anticipated commercial application,
+is use for noncommercial purposes.
+
+## Small-Scale Production
+
+You may use the software to develop, produce, or create
+products or services for up to ten (10) individual end
+users per month without triggering commercial purposes.
+
+## No Other Rights
+
+These terms do not allow you to sublicense or transfer any
+of your licenses to anyone else, or try to use them to
+make any legal claim against anyone else.
+
+## Defensive Termination
+
+If you make any legal claim against anyone accusing the software
+of infringing any patent you have, or of infringing any other
+intellectual property right you have:
+
+* your copyright license for the software ends automatically
+* your patent license for the software ends automatically
+
+Even if your legal claim is withdrawn or settled, your licenses
+terminate and do not automatically resume.
+
+## No Liability
+
+***As far as the law allows, the software comes as is, without
+any warranty or condition, and the licensor will not be
+liable to anyone for any damages related to the software or
+this license, under any kind of legal claim.***
+
+---
+
+## Commercial Licensing
+
+For commercial use, please contact:
+
+Samuel Gorzalnik
+gorzalniksamuel@gmail.com
+
+A separate commercial license agreement is required for:
+- Commercial products or services
+- SaaS/PaaS offerings
+- Internal corporate use
+- Any for-profit application
+
+Commercial licenses are available on a case-by-case basis.
+
+---
+
+## Summary
+
+| Use Case | Allowed? |
+|----------|----------|
+| Personal projects | ✅ Yes |
+| Open source (noncommercial) | ✅ Yes |
+| Education & research | ✅ Yes |
+| Government use | ✅ Yes |
+| Non-profits & charities | ✅ Yes |
+| Small scale (<10 users/month) | ✅ Yes |
+| Commercial products/services | ❌ Requires license |
+| SaaS/PaaS | ❌ Requires license |
+| Corporate internal use | ❌ Requires license |
+
+Contact for commercial licensing options.

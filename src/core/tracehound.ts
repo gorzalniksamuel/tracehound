@@ -7,12 +7,9 @@ import { EventEmitter } from "events";
 import { spawn, ChildProcess } from "child_process";
 import * as fs from "fs/promises";
 import * as path from "path";
-import { v4 as uuidv4 } from "crypto";
-import { PTYRecorder } from "../recorders/pty-recorder.js";
+import { nanoid } from "nanoid";
+import { ProcessWrapper } from "../recorders/process-wrapper.js";
 import { FilesystemMonitor } from "../recorders/filesystem-monitor.js";
-import { GitSnapshotter } from "../recorders/git-snapshotter.js";
-import { ProcessMonitor } from "../recorders/process-monitor.js";
-import { NetworkMonitor } from "../recorders/network-monitor.js";
 import { SecretDetector } from "../recorders/secret-detector.js";
 import { PolicyEngine } from "../policies/policy-engine.js";
 import { TraceWriter } from "./trace-writer.js";
@@ -26,17 +23,16 @@ export interface TraceHoundConfig extends TraceHoundOptions {
 
 export class TraceHound extends EventEmitter {
   private config: TraceHoundConfig;
-  private ptyRecorder: PTYRecorder;
+  private processWrapper: ProcessWrapper;
   private filesystemMonitor: FilesystemMonitor;
-  private gitSnapshotter: GitSnapshotter;
-  private processMonitor: ProcessMonitor;
-  private networkMonitor: NetworkMonitor;
   private secretDetector: SecretDetector;
   private policyEngine: PolicyEngine;
   private traceWriter: TraceWriter;
-  private childProcess?: ChildProcess;
   private events: AgentEvent[] = [];
   private warnings: string[] = [];
+  private commands: Array<{ ts: string; command: string }> = [];
+  private filesModified = 0;
+  private secretsAccessed = 0;
 
   constructor(options: TraceHoundOptions) {
     super();
@@ -53,11 +49,8 @@ export class TraceHound extends EventEmitter {
 
     // Initialize components
     this.traceWriter = new TraceWriter(workspacePath);
-    this.ptyRecorder = new PTYRecorder(workspacePath);
+    this.processWrapper = new ProcessWrapper(workspacePath);
     this.filesystemMonitor = new FilesystemMonitor();
-    this.gitSnapshotter = new GitSnapshotter();
-    this.processMonitor = new ProcessMonitor();
-    this.networkMonitor = new NetworkMonitor(options.netMode || "observe");
     this.secretDetector = new SecretDetector();
     this.policyEngine = new PolicyEngine();
   }
@@ -92,68 +85,55 @@ export class TraceHound extends EventEmitter {
     // Initialize trace writer
     await this.traceWriter.initialize();
     
-    // Capture git state before
-    await this.gitSnapshotter.captureBefore();
+    // Capture initial git state
+    await this.captureGitBefore();
     
     // Load policy
     await this.policyEngine.load();
-    
+
     this.emit("initialized", { runId: this.config.runId });
   }
 
   private async startRecording(): Promise<void> {
     // Start filesystem monitoring
-    await this.filesystemMonitor.start(process.cwd(), (event) => {
-      this.handleFilesystemEvent(event);
-    });
+    await this.filesystemMonitor.start(
+      process.cwd(),
+      this.config.runId,
+      (event) => this.handleFilesystemEvent(event)
+    );
     
-    // Start process monitoring
-    this.processMonitor.start((event) => {
-      this.handleProcessEvent(event);
-    });
-    
-    // Start network monitoring if enabled
-    if (this.config.netMode !== "off") {
-      await this.networkMonitor.start((event) => {
-        this.handleNetworkEvent(event);
+    // Setup process wrapper event handlers
+    this.processWrapper.on("spawn", (data) => {
+      this.commands.push({
+        ts: new Date().toISOString(),
+        command: `${data.command} ${data.args?.join(" ") || ""}`
       });
-    }
-    
+    });
+
     this.emit("recording-started", { runId: this.config.runId });
   }
 
   private async executeAgent(agentCommand: string): Promise<number> {
-    return new Promise((resolve) => {
-      const [command, ...args] = agentCommand.split(" ");
-      
-      // Spawn in PTY for proper terminal handling
-      this.childProcess = this.ptyRecorder.spawn(command, args, {
-        cwd: process.cwd(),
-        env: process.env,
-      });
+    // Parse command
+    const parts = agentCommand.trim().split(/\s+/);
+    const command = parts[0];
+    const args = parts.slice(1);
 
-      // Forward stdio
-      this.ptyRecorder.onData((data) => {
-        process.stdout.write(data);
-      });
-
-      this.ptyRecorder.onExit((code) => {
-        resolve(code ?? 1);
-      });
+    return await this.processWrapper.spawn(command, args, {
+      cwd: process.cwd(),
+      shell: true,
     });
   }
 
   private async stopRecording(): Promise<void> {
-    // Stop all monitors
+    // Stop filesystem monitoring
     await this.filesystemMonitor.stop();
-    this.processMonitor.stop();
-    await this.networkMonitor.stop();
     
     // Close trace writer
     await this.traceWriter.close();
     
-    // Capture git state after
-    await this.gitSnapshotter.captureAfter();
+    // Capture final git state
+    await this.captureGitAfter();
     
     this.emit("recording-stopped", { runId: this.config.runId });
   }
@@ -161,6 +141,9 @@ export class TraceHound extends EventEmitter {
   private async finalize(exitCode: number): Promise<RunResult> {
     const endTime = new Date();
     const durationMs = endTime.getTime() - this.config.startTime.getTime();
+    
+    // Get git info
+    const gitInfo = await this.getGitInfo();
     
     // Generate manifest
     const manifest: RunManifest = {
@@ -174,18 +157,29 @@ export class TraceHound extends EventEmitter {
       },
       agent: {
         name: this.config.agent || "unknown",
-        command: this.childProcess?.spawnargs || [],
+        command: (this.commands[0]?.command || "").split(" "),
       },
       repo: {
         root: process.cwd(),
-        git: await this.gitSnapshotter.getInfo(),
+        git: gitInfo,
       },
-      summary: this.generateSummary(),
+      summary: {
+        filesModified: this.filesModified,
+        commandsRun: this.commands.length,
+        networkConnections: 0, // Not implemented yet
+        secretsAccessed: this.secretsAccessed,
+      },
       warnings: this.warnings,
     };
     
     // Write manifest
     await this.traceWriter.writeManifest(manifest);
+
+    // Generate report
+    const { ReportGenerator } = await import("../reports/report-generator.js");
+    const generator = new ReportGenerator(manifest);
+    await generator.generateMarkdownReport();
+    await generator.generateHtml();
     
     return {
       runId: this.config.runId,
@@ -195,70 +189,103 @@ export class TraceHound extends EventEmitter {
     };
   }
 
-  private generateSummary() {
-    const fileEvents = this.events.filter(e => e.type === "file.write" || e.type === "file.delete");
-    const commandEvents = this.events.filter(e => e.type === "process.exec");
-    const networkEvents = this.events.filter(e => e.type === "network.connect");
-    const secretEvents = this.events.filter(e => e.type === "secret.access");
-    
-    return {
-      filesModified: fileEvents.length,
-      commandsRun: commandEvents.length,
-      networkConnections: networkEvents.length,
-      secretsAccessed: secretEvents.length,
-    };
-  }
-
   private handleFilesystemEvent(event: AgentEvent): void {
+    // Track files modified
+    if (event.type === "file.write" || event.type === "file.delete") {
+      this.filesModified++;
+    }
+    
     // Check for secret access
-    if (this.secretDetector.isSecretPath(event.path)) {
-      this.warnings.push(`Secret file accessed: ${event.path}`);
-      this.emitWarning("secret.access", event);
+    if (event.path && this.secretDetector.isSecretPath(event.path)) {
+      this.secretsAccessed++;
+      this.warnings.push(`Secret file touched: ${event.path}`);
+      
+      const secretEvent: AgentEvent = {
+        ts: event.ts,
+        type: "secret.access",
+        runId: this.config.runId,
+        path: event.path,
+        category: this.secretDetector.getSecretCategory(event.path) || "other",
+        redacted: true,
+      };
+      
+      this.traceWriter.writeEvent(secretEvent);
     }
     
     // Check policy
-    const decision = this.policyEngine.evaluateFilesystem(event);
-    if (decision.action !== "allow") {
-      this.emitWarning(`policy.${decision.action}`, event, decision.reason);
+    if (event.type === "file.write" || event.type === "file.delete") {
+      const decision = this.policyEngine.evaluateFilesystem(event as any);
+      if (decision.action !== "allow") {
+        this.warnings.push(`Policy ${decision.action}: ${decision.reason}`);
+      }
     }
     
     this.events.push(event);
     this.traceWriter.writeEvent(event);
   }
 
-  private handleProcessEvent(event: AgentEvent): void {
-    // Check policy
-    const decision = this.policyEngine.evaluateCommand(event);
-    if (decision.action !== "allow") {
-      this.emitWarning(`policy.${decision.action}`, event, decision.reason);
+  private async captureGitBefore(): Promise<void> {
+    try {
+      const { exec } = await import("child_process");
+      const patchPath = path.join(this.config.workspacePath, "git-before.patch");
+      
+      exec("git diff", { cwd: process.cwd() }, async (error, stdout) => {
+        await fs.writeFile(patchPath, stdout);
+      });
+    } catch {
+      // Not a git repo
     }
-    
-    this.events.push(event);
-    this.traceWriter.writeEvent(event);
   }
 
-  private handleNetworkEvent(event: AgentEvent): void {
-    // Check policy
-    const decision = this.policyEngine.evaluateNetwork(event);
-    if (decision.action !== "allow") {
-      this.emitWarning(`policy.${decision.action}`, event, decision.reason);
+  private async captureGitAfter(): Promise<void> {
+    try {
+      const { exec } = await import("child_process");
+      const patchPath = path.join(this.config.workspacePath, "git-after.patch");
+      
+      exec("git diff", { cwd: process.cwd() }, async (error, stdout) => {
+        await fs.writeFile(patchPath, stdout);
+      });
+    } catch {
+      // Not a git repo
     }
-    
-    this.events.push(event);
-    this.traceWriter.writeEvent(event);
   }
 
-  private emitWarning(type: string, event: AgentEvent, reason?: string): void {
-    const warning = reason || `${type}: ${JSON.stringify(event)}`;
-    this.warnings.push(warning);
-    this.emit("warning", { type, event, reason });
+  private async getGitInfo(): Promise<any> {
+    try {
+      const { execSync } = await import("child_process");
+      
+      const branch = execSync("git branch --show-current", { 
+        cwd: process.cwd(),
+        encoding: "utf-8",
+        timeout: 1000 
+      }).trim();
+      
+      const commit = execSync("git rev-parse HEAD", {
+        cwd: process.cwd(),
+        encoding: "utf-8",
+        timeout: 1000
+      }).trim();
+      
+      const status = execSync("git status --porcelain", {
+        cwd: process.cwd(),
+        encoding: "utf-8",
+        timeout: 1000
+      }).trim();
+      
+      return {
+        isRepo: true,
+        branch,
+        commit: commit.slice(0, 8),
+        dirty: status.length > 0,
+      };
+    } catch {
+      return { isRepo: false };
+    }
   }
 
   private async cleanup(): Promise<void> {
     try {
       await this.filesystemMonitor.stop();
-      this.processMonitor.stop();
-      await this.networkMonitor.stop();
       await this.traceWriter.close();
     } catch {
       // Ignore cleanup errors
@@ -268,7 +295,7 @@ export class TraceHound extends EventEmitter {
   private generateRunId(): string {
     const now = new Date();
     const timestamp = now.toISOString().replace(/[:.]/g, "-").slice(0, -5);
-    const random = Math.random().toString(36).substring(2, 6);
-    return `${timestamp}_${random}`;
+    const shortId = nanoid(6);
+    return `${timestamp}_${shortId}`;
   }
 }

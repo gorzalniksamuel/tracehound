@@ -65,6 +65,19 @@ export class ReportGenerator {
     return lines.join("\n");
   }
 
+  async generateMarkdownReport(): Promise<string> {
+    const report = this.generateMarkdown();
+    const reportPath = path.join(
+      process.cwd(),
+      ".tracehound",
+      "runs",
+      this.manifest.run.id,
+      "report.md"
+    );
+    await fs.writeFile(reportPath, report);
+    return reportPath;
+  }
+
   async generateHtml(): Promise<string> {
     const html = `
 <!DOCTYPE html>
@@ -103,7 +116,7 @@ export class ReportGenerator {
 </head>
 <body>
   <div class="container">
-    <h1>🎬 TraceHound Report</h1>
+    <h1>🐕 TraceHound Report</h1>
     
     <div class="meta">
       <div class="meta-item">
@@ -252,6 +265,6 @@ export class ReportGenerator {
   }
 
   private getRunDir(): string {
-    return path.join(process.cwd(), ".agentbox", "runs", this.manifest.run.id);
+    return path.join(process.cwd(), ".tracehound", "runs", this.manifest.run.id);
   }
 }

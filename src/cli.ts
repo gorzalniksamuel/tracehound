@@ -6,9 +6,12 @@
 
 import { Command } from "commander";
 import chalk from "chalk";
-import { TraceHound } from "./core/agentbox.js";
-import { ReportGenerator } from "./reports/report-generator.js";
+import * as fs from "fs/promises";
+import * as path from "path";
+import { TraceHound } from "./core/tracehound.js";
 import { RunStore } from "./core/run-store.js";
+import { ReportGenerator } from "./reports/report-generator.js";
+import { RunManifest } from "./types/index.js";
 
 const program = new Command();
 
@@ -23,13 +26,9 @@ program
   .option("-n, --name <name>", "Assign a name to this run")
   .option("-a, --agent <agent>", "Specify agent type (codex, claude, opencode, openclaw)")
   .option("-m, --mode <mode>", "Recording mode (record, warn, enforce)", "record")
-  .option("--net <mode>", "Network monitoring mode (observe, proxy, off)", "observe")
-  .argument("<command...>", "Agent command to run (use -- to separate)")
+  .argument("<command...>", "Agent command to run")
   .action(async (args: string[], options) => {
-    const agentCommand = args
-      .join(" ")
-      .replace(/^--\s*/, "")
-      .trim();
+    const agentCommand = args.join(" ").trim();
     
     if (!agentCommand) {
       console.error(chalk.red("Error: No agent command specified"));
@@ -42,7 +41,6 @@ program
       name: options.name,
       agent: options.agent,
       mode: options.mode,
-      netMode: options.net,
     });
 
     try {
@@ -58,8 +56,8 @@ program
         result.warnings.forEach(w => console.log(chalk.yellow(`  - ${w}`)));
       }
       
-    } catch (error) {
-      console.error(chalk.red("\n❌ Recording failed:"), error);
+    } catch (error: any) {
+      console.error(chalk.red("\n❌ Recording failed:"), error.message || error);
       process.exit(1);
     }
   });
@@ -70,25 +68,36 @@ program
   .argument("[run-id]", "Run ID (defaults to latest)")
   .option("--html", "Generate HTML report")
   .option("--json", "Output as JSON")
-  .action(async (runId, options) => {
+  .action(async (runId: string | undefined, options: { html?: boolean; json?: boolean }) => {
     const store = new RunStore();
-    const targetRunId = runId || store.getLatestRunId();
+    const targetRunId = runId || await getLatestRunId();
     
     if (!targetRunId) {
       console.error(chalk.red("No runs found. Run 'tracehound run' first."));
       process.exit(1);
     }
 
-    const run = store.getRun(targetRunId);
-    if (!run) {
+    const manifestPath = path.join(
+      process.cwd(), 
+      ".tracehound", 
+      "runs", 
+      targetRunId, 
+      "manifest.json"
+    );
+    
+    let manifest: RunManifest;
+    try {
+      const data = await fs.readFile(manifestPath, "utf-8");
+      manifest = JSON.parse(data) as RunManifest;
+    } catch (error) {
       console.error(chalk.red(`Run not found: ${targetRunId}`));
       process.exit(1);
     }
 
-    const generator = new ReportGenerator(run);
+    const generator = new ReportGenerator(manifest);
     
     if (options.json) {
-      console.log(JSON.stringify(run.manifest, null, 2));
+      console.log(JSON.stringify(manifest, null, 2));
     } else if (options.html) {
       const htmlPath = await generator.generateHtml();
       console.log(chalk.green(`HTML report: ${htmlPath}`));
@@ -102,9 +111,8 @@ program
   .command("list")
   .description("List recorded sessions")
   .option("--json", "Output as JSON")
-  .action(async (options) => {
-    const store = new RunStore();
-    const runs = store.listRuns();
+  .action(async (options: { json?: boolean }) => {
+    const runs = await listRuns();
     
     if (options.json) {
       console.log(JSON.stringify(runs, null, 2));
@@ -120,8 +128,8 @@ program
     runs.forEach((run, i) => {
       const indicator = i === 0 ? chalk.cyan("→ ") : "  ";
       const date = new Date(run.timestamp).toLocaleString();
-      const agent = run.agent ? chalk.gray(`[${run.agent}]`) : "";
-      console.log(`${indicator}${chalk.white(run.id)} ${chalk.gray(date)} ${agent}`);
+      const agentName = run.agent ? chalk.gray(`[${run.agent}]`) : "";
+      console.log(`${indicator}${chalk.white(run.id)} ${chalk.gray(date)} ${agentName}`);
       if (run.name) {
         console.log(`     ${chalk.gray(run.name)}`);
       }
@@ -133,9 +141,8 @@ program
   .command("replay")
   .description("Replay a recorded session")
   .argument("<run-id>", "Run ID to replay")
-  .action(async (runId) => {
+  .action(async (runId: string) => {
     console.log(chalk.blue("Replaying session...") + chalk.gray(` (${runId})`));
-    // TODO: Implement replay
     console.log(chalk.gray("Replay feature coming soon!"));
   });
 
@@ -144,20 +151,56 @@ program
   .description("Compare two recorded sessions")
   .argument("<run-id-1>", "First run ID")
   .argument("<run-id-2>", "Second run ID")
-  .action(async (runId1, runId2) => {
+  .action(async (runId1: string, runId2: string) => {
     console.log(chalk.blue("Comparing sessions..."));
-    // TODO: Implement comparison
     console.log(chalk.gray("Comparison feature coming soon!"));
   });
 
-program
-  .command("tui")
-  .description("Launch TUI viewer")
-  .action(async () => {
-    console.log(chalk.blue("Launching TUI..."));
-    // TODO: Implement TUI
-    console.log(chalk.gray("TUI coming soon!"));
-  });
+async function getLatestRunId(): Promise<string | null> {
+  try {
+    const runsPath = path.join(process.cwd(), ".tracehound", "runs");
+    const entries = await fs.readdir(runsPath);
+    const runs = entries
+      .filter(e => !e.startsWith("."))
+      .sort()
+      .reverse();
+    return runs[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+async function listRuns(): Promise<Array<{ id: string; name?: string; timestamp: string; agent?: string }>> {
+  try {
+    const runsPath = path.join(process.cwd(), ".tracehound", "runs");
+    const entries = await fs.readdir(runsPath);
+    const runs: Array<{ id: string; name?: string; timestamp: string; agent?: string }> = [];
+    
+    for (const entry of entries) {
+      if (entry.startsWith(".")) continue;
+      
+      const manifestPath = path.join(runsPath, entry, "manifest.json");
+      try {
+        const data = await fs.readFile(manifestPath, "utf-8");
+        const manifest: RunManifest = JSON.parse(data);
+        runs.push({
+          id: manifest.run.id,
+          name: manifest.run.name,
+          timestamp: manifest.run.timestamp,
+          agent: manifest.agent.name,
+        });
+      } catch {
+        // Skip invalid manifests
+      }
+    }
+    
+    return runs.sort((a, b) => 
+      new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+    );
+  } catch {
+    return [];
+  }
+}
 
 function formatDuration(ms: number): string {
   const seconds = Math.floor(ms / 1000);
