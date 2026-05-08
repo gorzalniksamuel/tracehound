@@ -1,19 +1,24 @@
 /**
  * Filesystem Monitor
- * Watches file system events using chokidar
+ * Smart file tracking using fd (find) for efficiency
  */
 
 import * as chokidar from "chokidar";
 import * as fs from "fs/promises";
 import * as path from "path";
+import { exec } from "child_process";
+import { promisify } from "util";
 import { FileEvent, AgentEvent } from "../types/index.js";
+
+const execAsync = promisify(exec);
 
 export class FilesystemMonitor {
   private watcher?: chokidar.FSWatcher;
   private eventHandler?: (event: AgentEvent) => void;
   private runId: string = "";
-  private processedFiles = new Set<string>();
   private fileHashes = new Map<string, string>();
+  private watchedFiles = new Set<string>();
+  private rootPath: string = "";
 
   async start(
     rootPath: string,
@@ -22,13 +27,22 @@ export class FilesystemMonitor {
   ): Promise<void> {
     this.eventHandler = onEvent;
     this.runId = runId;
+    this.rootPath = rootPath;
 
-    // Get initial file hashes for comparison
+    // Capture initial state of git-tracked and recently modified files
     await this.captureInitialState(rootPath);
 
-    // Watch with chokidar - ignore node_modules and .git
-    // Also ignore permission-denied files by using the ignored option
-    this.watcher = chokidar.watch(rootPath, {
+    // Watch only specific files/dirs, not everything
+    const watchPaths = await this.getWatchPaths(rootPath);
+    
+    if (watchPaths.length === 0) {
+      console.log("⚠️  No files to watch - running without file monitoring");
+      return;
+    }
+
+    console.log(`📁 Watching ${watchPaths.length} paths...`);
+
+    this.watcher = chokidar.watch(watchPaths, {
       ignored: [
         /(^|[\/\\])\../,  // dotfiles
         "**/node_modules/**",
@@ -36,109 +50,35 @@ export class FilesystemMonitor {
         "**/dist/**",
         "**/build/**",
         "**/.tracehound/**",
-        "**/*.key",       // Ignore key files (permission issues)
-        "**/*.pem",       // Ignore cert files
-        "**/*.crt",       // Ignore cert files
-        "**/Library/**",  // Ignore macOS Library directory (system files)
-        "**/Applications/**", // Ignore Applications
-        "**/System/**",   // Ignore macOS System
-        "**/Developer/**", // Ignore Developer tools
-        "**/Group Containers/**", // Ignore Group Containers
-        "**/GroupContainersAlias/**", // Ignore GroupContainersAlias
-        "**/Application Support/**", // Ignore Application Support
-        "**/*.socket",    // Ignore socket files
-        "**/*.spice",     // Ignore spice files
-        "**/*Socket*",    // Ignore anything with Socket in name
+        "**/*.log",
+        "**/*.tmp",
+        "**/*.temp",
+        "**/.DS_Store",
+        "**/Thumbs.db",
       ],
       persistent: true,
       ignoreInitial: true,
-      depth: 1,  // Only watch 1 level deep to avoid too many files
+      followSymlinks: false,
       awaitWriteFinish: {
-        stabilityThreshold: 300,
-        pollInterval: 100,
+        stabilityThreshold: 100,
+        pollInterval: 50,
       },
-      ignorePermissionErrors: true,  // Ignore EACCES errors
+      ignorePermissionErrors: true,
     });
 
-    // Handle errors silently
-    this.watcher.on("error", (error: any) => {
-      // Silently ignore permission errors (EACCES, EPERM, EMFILE, UNKNOWN)
-      const ignoredCodes = ["EACCES", "EPERM", "EMFILE", "UNKNOWN"];
-      if (ignoredCodes.includes(error.code)) return;
-      console.error("File watcher error:", error);
+    // Handle file events
+    this.watcher.on("add", (filePath) => this.handleFileChange(filePath, "add"));
+    this.watcher.on("change", (filePath) => this.handleFileChange(filePath, "change"));
+    this.watcher.on("unlink", (filePath) => this.handleFileDelete(filePath));
+
+    // Silent error handling
+    this.watcher.on("error", () => {
+      // Silently ignore - EMFILE etc handled by ignorePermissionErrors
     });
 
-    // Handle add events
-    this.watcher.on("add", async (filePath) => {
-      try {
-        if (this.processedFiles.has(filePath)) return;
-        this.processedFiles.add(filePath);
-
-        const relativePath = path.relative(rootPath, filePath);
-        const size = await this.getFileSize(filePath);
-        const hash = await this.getFileHash(filePath);
-        
-        const event: FileEvent = {
-          ts: new Date().toISOString(),
-          type: "file.write",
-          runId,
-          path: relativePath,
-          size,
-          hash,
-        };
-
-        this.eventHandler?.(event);
-      } catch {
-        // Ignore errors for individual files
-      }
-    });
-
-    // Handle change events
-    this.watcher.on("change", async (filePath) => {
-      try {
-        const relativePath = path.relative(rootPath, filePath);
-        const size = await this.getFileSize(filePath);
-        const hash = await this.getFileHash(filePath);
-        const beforeHash = this.fileHashes.get(filePath);
-
-        const event: FileEvent = {
-          ts: new Date().toISOString(),
-          type: "file.write",
-          runId,
-          path: relativePath,
-          size,
-          hash_after: hash,
-          hash_before: beforeHash,
-        };
-
-        if (hash) {
-          this.fileHashes.set(filePath, hash);
-        }
-        this.eventHandler?.(event);
-      } catch {
-        // Ignore errors for individual files
-      }
-    });
-
-    // Handle unlink events
-    this.watcher.on("unlink", (filePath) => {
-      const relativePath = path.relative(rootPath, filePath);
-      
-      const event: FileEvent = {
-        ts: new Date().toISOString(),
-        type: "file.delete",
-        runId,
-        path: relativePath,
-      };
-
-      this.processedFiles.delete(filePath);
-      this.fileHashes.delete(filePath);
-      this.eventHandler?.(event);
-    });
-
-    // Wait for watcher to be ready (with timeout)
+    // Wait for ready
     await new Promise<void>((resolve) => {
-      const timeout = setTimeout(() => resolve(), 5000);  // 5 second timeout
+      const timeout = setTimeout(() => resolve(), 3000);
       this.watcher?.on("ready", () => {
         clearTimeout(timeout);
         resolve();
@@ -148,17 +88,90 @@ export class FilesystemMonitor {
 
   async stop(): Promise<void> {
     await this.watcher?.close();
-    this.processedFiles.clear();
+    this.watchedFiles.clear();
     this.fileHashes.clear();
   }
 
-  private async captureInitialState(rootPath: string): Promise<void> {
-    // Try to capture git-tracked files initially
+  /**
+   * Get list of paths to watch using fd (if available) or git
+   */
+  private async getWatchPaths(rootPath: string): Promise<string[]> {
+    const paths: string[] = [];
+    const maxFiles = 500; // Limit to prevent EMFILE
+    
     try {
-      const gitLsFiles = await this.execGit("ls-files", rootPath);
-      const files = gitLsFiles.split("\n").filter(f => f.trim());
+      // Try fd command first (fastest)
+      const { stdout: fdOutput } = await execAsync(
+        `fd --type f --changed-within 1h --max-results ${maxFiles} . "${rootPath}" 2>/dev/null || echo ""`,
+        { timeout: 5000 }
+      );
       
-      for (const file of files.slice(0, 100)) { // Limit to first 100 files
+      const fdFiles = fdOutput.split("\n").filter(f => f.trim() && !this.shouldIgnore(f));
+      paths.push(...fdFiles.slice(0, maxFiles));
+    } catch {
+      // fd not available, try git
+      try {
+        const { stdout: gitOutput } = await execAsync(
+          `git ls-files --others --exclude-standard --modified 2>/dev/null | head -${maxFiles}`,
+          { cwd: rootPath, timeout: 5000 }
+        );
+        
+        const gitFiles = gitOutput.split("\n")
+          .filter(f => f.trim())
+          .map(f => path.join(rootPath, f));
+        paths.push(...gitFiles);
+      } catch {
+        // Not a git repo - fall back to watching nothing
+      }
+    }
+
+    // If still empty, try to find recently modified files manually
+    if (paths.length === 0) {
+      try {
+        const entries = await fs.readdir(rootPath, { withFileTypes: true });
+        for (const entry of entries.slice(0, 50)) {
+          if (entry.isFile() && !this.shouldIgnore(entry.name)) {
+            paths.push(path.join(rootPath, entry.name));
+          } else if (entry.isDirectory() && !this.shouldIgnore(entry.name)) {
+            // Add top-level dirs only
+            paths.push(path.join(rootPath, entry.name));
+          }
+        }
+      } catch {
+        // Can't read dir
+      }
+    }
+
+    return [...new Set(paths)].slice(0, maxFiles);
+  }
+
+  private shouldIgnore(filePath: string): boolean {
+    const ignorePatterns = [
+      /node_modules/,
+      /\.git/,
+      /\.tracehound/,
+      /dist/,
+      /build/,
+      /Library/,
+      /Applications/,
+      /\.log$/,
+      /\.tmp$/,
+      /\.DS_Store$/,
+    ];
+    return ignorePatterns.some(p => p.test(filePath));
+  }
+
+  private async captureInitialState(rootPath: string): Promise<void> {
+    try {
+      // Get git-tracked files with hashes
+      const { stdout } = await execAsync(
+        "git ls-files | head -200",
+        { cwd: rootPath, timeout: 3000 }
+      );
+      
+      const files = stdout.split("\n").filter(f => f.trim());
+      
+      for (const file of files) {
         const fullPath = path.join(rootPath, file);
         try {
           const hash = await this.getFileHash(fullPath);
@@ -166,12 +179,54 @@ export class FilesystemMonitor {
             this.fileHashes.set(fullPath, hash);
           }
         } catch {
-          // File might not exist or no permission
+          // Skip files we can't read
         }
       }
     } catch {
-      // Not a git repo or git not available
+      // Not a git repo
     }
+  }
+
+  private async handleFileChange(filePath: string, eventType: "add" | "change"): Promise<void> {
+    try {
+      const relativePath = path.relative(this.rootPath, filePath);
+      const size = await this.getFileSize(filePath);
+      const hash = await this.getFileHash(filePath);
+      const beforeHash = this.fileHashes.get(filePath);
+
+      const event: FileEvent = {
+        ts: new Date().toISOString(),
+        type: eventType === "add" ? "file.write" : "file.write",
+        runId: this.runId,
+        path: relativePath,
+        size,
+        hash_after: hash,
+        hash_before: beforeHash,
+      };
+
+      if (hash) {
+        this.fileHashes.set(filePath, hash);
+      }
+      this.watchedFiles.add(filePath);
+      this.eventHandler?.(event);
+    } catch {
+      // Silently skip files we can't process
+    }
+  }
+
+  private handleFileDelete(filePath: string): void {
+    const relativePath = path.relative(this.rootPath, filePath);
+    
+    const event: FileEvent = {
+      ts: new Date().toISOString(),
+      type: "file.delete",
+      runId: this.runId,
+      path: relativePath,
+    };
+
+    this.watchedFiles.delete(filePath);
+    this.fileHashes.delete(filePath);
+    this.eventHandler?.(event);
   }
 
   private async getFileSize(filePath: string): Promise<number | undefined> {
@@ -186,20 +241,21 @@ export class FilesystemMonitor {
   private async getFileHash(filePath: string): Promise<string | undefined> {
     try {
       const content = await fs.readFile(filePath);
-      // Simple hash - in production use crypto
-      return `md5:${Buffer.from(content).toString("base64").slice(0, 16)}`;
+      // Use crypto for proper hashing
+      const crypto = await import("crypto");
+      return crypto.createHash("sha256").update(content).digest("hex").slice(0, 16);
     } catch {
       return undefined;
     }
   }
 
-  private async execGit(command: string, cwd: string): Promise<string> {
-    const { exec } = await import("child_process");
-    return new Promise((resolve, reject) => {
-      exec(`git ${command}`, { cwd }, (error, stdout) => {
-        if (error) reject(error);
-        else resolve(stdout);
-      });
-    });
+  /**
+   * Get list of files modified during this session
+   */
+  getModifiedFiles(): Array<{ path: string; hash?: string }> {
+    return Array.from(this.watchedFiles).map(filePath => ({
+      path: path.relative(this.rootPath, filePath),
+      hash: this.fileHashes.get(filePath),
+    }));
   }
 }

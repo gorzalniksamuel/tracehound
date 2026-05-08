@@ -4,13 +4,13 @@
  */
 
 import { EventEmitter } from "events";
-import { spawn, ChildProcess } from "child_process";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { nanoid } from "nanoid";
 import { ProcessWrapper } from "../recorders/process-wrapper.js";
 import { FilesystemMonitor } from "../recorders/filesystem-monitor.js";
 import { SecretDetector } from "../recorders/secret-detector.js";
+import { PassiveNetworkMonitor } from "../recorders/network-proxy.js";
 import { PolicyEngine } from "../policies/policy-engine.js";
 import { TraceWriter } from "./trace-writer.js";
 import { RunManifest, TraceHoundOptions, RunResult, AgentEvent, FileEvent } from "../types/index.js";
@@ -25,6 +25,7 @@ export class TraceHound extends EventEmitter {
   private config: TraceHoundConfig;
   private processWrapper: ProcessWrapper;
   private filesystemMonitor: FilesystemMonitor;
+  private networkMonitor: PassiveNetworkMonitor;
   private secretDetector: SecretDetector;
   private policyEngine: PolicyEngine;
   private traceWriter: TraceWriter;
@@ -33,6 +34,7 @@ export class TraceHound extends EventEmitter {
   private commands: Array<{ ts: string; command: string }> = [];
   private filesModified = 0;
   private secretsAccessed = 0;
+  private networkConnections = 0;
 
   constructor(options: TraceHoundOptions) {
     super();
@@ -47,10 +49,10 @@ export class TraceHound extends EventEmitter {
       startTime: new Date(),
     };
 
-    // Initialize components
     this.traceWriter = new TraceWriter(workspacePath);
     this.processWrapper = new ProcessWrapper(workspacePath);
     this.filesystemMonitor = new FilesystemMonitor();
+    this.networkMonitor = new PassiveNetworkMonitor();
     this.secretDetector = new SecretDetector();
     this.policyEngine = new PolicyEngine();
   }
@@ -102,6 +104,16 @@ export class TraceHound extends EventEmitter {
       (event) => this.handleFilesystemEvent(event as FileEvent)
     );
     
+    // Start network monitoring
+    await this.networkMonitor.start(
+      this.config.runId,
+      (event) => {
+        this.networkConnections++;
+        this.events.push(event);
+        this.traceWriter.writeEvent(event);
+      }
+    );
+    
     // Setup process wrapper event handlers
     this.processWrapper.on("spawn", (data) => {
       this.commands.push({
@@ -114,7 +126,6 @@ export class TraceHound extends EventEmitter {
   }
 
   private async executeAgent(agentCommand: string): Promise<number> {
-    // Parse command
     const parts = agentCommand.trim().split(/\s+/);
     const command = parts[0];
     const args = parts.slice(1);
@@ -126,8 +137,9 @@ export class TraceHound extends EventEmitter {
   }
 
   private async stopRecording(): Promise<void> {
-    // Stop filesystem monitoring
+    // Stop all monitors
     await this.filesystemMonitor.stop();
+    await this.networkMonitor.stop();
     
     // Close trace writer
     await this.traceWriter.close();
@@ -145,6 +157,19 @@ export class TraceHound extends EventEmitter {
     // Get git info
     const gitInfo = await this.getGitInfo();
     
+    // Calculate risk score
+    const riskScore = this.calculateRiskScore();
+    
+    // Generate summary
+    const summary = {
+      filesModified: this.filesModified,
+      commandsRun: this.commands.length,
+      networkConnections: this.networkConnections,
+      secretsAccessed: this.secretsAccessed,
+      riskScore: riskScore.score,
+      riskLevel: riskScore.level,
+    };
+
     // Generate manifest
     const manifest: RunManifest = {
       schema: "tracehound.manifest.v1",
@@ -163,12 +188,7 @@ export class TraceHound extends EventEmitter {
         root: process.cwd(),
         git: gitInfo,
       },
-      summary: {
-        filesModified: this.filesModified,
-        commandsRun: this.commands.length,
-        networkConnections: 0, // Not implemented yet
-        secretsAccessed: this.secretsAccessed,
-      },
+      summary,
       warnings: this.warnings,
     };
     
@@ -181,6 +201,22 @@ export class TraceHound extends EventEmitter {
     await generator.generateMarkdownReport();
     await generator.generateHtml();
     
+    // Print summary
+    console.log("\n" + "=".repeat(50));
+    console.log("📊 TraceHound Summary");
+    console.log("=".repeat(50));
+    console.log(`Files Modified:     ${summary.filesModified}`);
+    console.log(`Commands Run:       ${summary.commandsRun}`);
+    console.log(`Network Connections: ${summary.networkConnections}`);
+    console.log(`Secrets Accessed:   ${summary.secretsAccessed}`);
+    console.log(`Risk Score:         ${summary.riskScore} (${summary.riskLevel})`);
+    console.log("=".repeat(50));
+    
+    if (this.warnings.length > 0) {
+      console.log("\n⚠️  Warnings:");
+      this.warnings.forEach(w => console.log(`  - ${w}`));
+    }
+    
     return {
       runId: this.config.runId,
       durationMs,
@@ -190,7 +226,6 @@ export class TraceHound extends EventEmitter {
   }
 
   private handleFilesystemEvent(event: FileEvent): void {
-    // Track files modified
     if (event.type === "file.write" || event.type === "file.delete") {
       this.filesModified++;
     }
@@ -213,8 +248,8 @@ export class TraceHound extends EventEmitter {
     }
     
     // Check policy
-    if (event.type === "file.write" || event.type === "file.delete") {
-      const decision = this.policyEngine.evaluateFilesystem(event as any);
+    if (event.type === "file.write") {
+      const decision = this.policyEngine.evaluateFilesystem(event);
       if (decision.action !== "allow") {
         this.warnings.push(`Policy ${decision.action}: ${decision.reason}`);
       }
@@ -224,14 +259,35 @@ export class TraceHound extends EventEmitter {
     this.traceWriter.writeEvent(event);
   }
 
+  private calculateRiskScore(): { score: number; level: string } {
+    let score = 0;
+    
+    // Risk factors
+    score += this.filesModified * 1;
+    score += this.commands.length * 0.5;
+    score += this.networkConnections * 2;
+    score += this.secretsAccessed * 10;
+    score += this.warnings.length * 3;
+    
+    // Determine level
+    let level = "Low 🟢";
+    if (score >= 10) {
+      level = "Medium 🟡";
+    }
+    if (score >= 25) {
+      level = "High 🔴";
+    }
+    
+    return { score, level };
+  }
+
   private async captureGitBefore(): Promise<void> {
     try {
-      const { exec } = await import("child_process");
+      const { execAsync } = await import("../utils/exec.js");
       const patchPath = path.join(this.config.workspacePath, "git-before.patch");
       
-      exec("git diff", { cwd: process.cwd() }, async (_err, stdout) => {
-        await fs.writeFile(patchPath, stdout);
-      });
+      const { stdout } = await execAsync("git diff 2>/dev/null || echo ''", { cwd: process.cwd() });
+      await fs.writeFile(patchPath, stdout);
     } catch {
       // Not a git repo
     }
@@ -239,12 +295,11 @@ export class TraceHound extends EventEmitter {
 
   private async captureGitAfter(): Promise<void> {
     try {
-      const { exec } = await import("child_process");
+      const { execAsync } = await import("../utils/exec.js");
       const patchPath = path.join(this.config.workspacePath, "git-after.patch");
       
-      exec("git diff", { cwd: process.cwd() }, async (_err, stdout) => {
-        await fs.writeFile(patchPath, stdout);
-      });
+      const { stdout } = await execAsync("git diff 2>/dev/null || echo ''", { cwd: process.cwd() });
+      await fs.writeFile(patchPath, stdout);
     } catch {
       // Not a git repo
     }
@@ -252,31 +307,20 @@ export class TraceHound extends EventEmitter {
 
   private async getGitInfo(): Promise<any> {
     try {
-      const { execSync } = await import("child_process");
+      const { execAsync } = await import("../utils/exec.js");
       
-      const branch = execSync("git branch --show-current", { 
-        cwd: process.cwd(),
-        encoding: "utf-8",
-        timeout: 1000 
-      }).trim();
-      
-      const commit = execSync("git rev-parse HEAD", {
-        cwd: process.cwd(),
-        encoding: "utf-8",
-        timeout: 1000
-      }).trim();
-      
-      const status = execSync("git status --porcelain", {
-        cwd: process.cwd(),
-        encoding: "utf-8",
-        timeout: 1000
-      }).trim();
+      const [{ stdout: branch }, { stdout: commit }, { stdout: status }] = await Promise.all([
+        execAsync("git branch --show-current 2>/dev/null || echo 'unknown'", { cwd: process.cwd() }),
+        execAsync("git rev-parse HEAD 2>/dev/null || echo 'unknown'", { cwd: process.cwd() }),
+        execAsync("git status --porcelain 2>/dev/null || echo ''", { cwd: process.cwd() }),
+      ]);
       
       return {
         isRepo: true,
-        branch,
-        commit: commit.slice(0, 8),
-        dirty: status.length > 0,
+        branch: branch.trim(),
+        // Truncate commit to 8 characters
+        commit: commit.trim().slice(0, 8),
+        dirty: status.trim().length > 0,
       };
     } catch {
       return { isRepo: false };
@@ -286,6 +330,7 @@ export class TraceHound extends EventEmitter {
   private async cleanup(): Promise<void> {
     try {
       await this.filesystemMonitor.stop();
+      await this.networkMonitor.stop();
       await this.traceWriter.close();
     } catch {
       // Ignore cleanup errors

@@ -1,6 +1,6 @@
 /**
  * Process Wrapper
- * Wraps agent commands and captures output without native dependencies
+ * Wraps agent commands and captures comprehensive output
  */
 
 import { spawn, SpawnOptions, ChildProcess } from "child_process";
@@ -14,13 +14,20 @@ interface ProcessWrapperOptions {
   shell?: boolean;
 }
 
+interface ProcessEvent {
+  command: string;
+  args: string[];
+  cwd: string;
+  timestamp: number;
+}
+
 export class ProcessWrapper extends EventEmitter {
   private child?: ChildProcess;
-  private outputBuffer: string[] = [];
   private startTime?: number;
   private outputPath: string;
   private stdoutData = "";
   private stderrData = "";
+  private commands: ProcessEvent[] = [];
 
   constructor(private workspacePath: string) {
     super();
@@ -30,24 +37,32 @@ export class ProcessWrapper extends EventEmitter {
   async spawn(command: string, args: string[] = [], options: ProcessWrapperOptions = {}): Promise<number> {
     return new Promise((resolve, reject) => {
       this.startTime = Date.now();
+      const cwd = options.cwd || process.cwd();
+
+      // Record the command
+      const event: ProcessEvent = {
+        command,
+        args,
+        cwd,
+        timestamp: this.startTime,
+      };
+      this.commands.push(event);
+      this.emit("spawn", event);
 
       const spawnOptions: SpawnOptions = {
-        cwd: options.cwd || process.cwd(),
-        env: { ...process.env, ...options.env },
+        cwd,
+        env: { ...process.env, ...options.env, FORCE_COLOR: "1" },
         shell: options.shell ?? true,
         stdio: ["inherit", "pipe", "pipe"],
       };
 
-      // Handle command that might be a shell string
+      // Handle command with spaces
       let finalCommand = command;
       let finalArgs = args;
 
       if (args.length === 0 && command.includes(" ")) {
-        // Single command with arguments - use shell
         spawnOptions.shell = true;
       }
-
-      this.emit("spawn", { command: finalCommand, args: finalArgs, timestamp: this.startTime });
 
       this.child = spawn(finalCommand, finalArgs, spawnOptions);
 
@@ -77,7 +92,8 @@ export class ProcessWrapper extends EventEmitter {
           signal,
           duration,
           stdout: this.stdoutData,
-          stderr: this.stderrData
+          stderr: this.stderrData,
+          commands: this.commands,
         });
         
         resolve(code ?? (signal ? 1 : 0));
@@ -95,14 +111,34 @@ export class ProcessWrapper extends EventEmitter {
   }
 
   private async saveOutput(): Promise<void> {
-    const output = `=== STDOUT ===\n${this.stdoutData}\n\n=== STDERR ===\n${this.stderrData}`;
-    await fs.writeFile(this.outputPath, output);
+    const output = [
+      "=== STDOUT ===",
+      this.stdoutData,
+      "",
+      "=== STDERR ===",
+      this.stderrData,
+      "",
+      "=== SUMMARY ===",
+      `Commands run: ${this.commands.length}`,
+      `Duration: ${this.startTime ? Date.now() - this.startTime : 0}ms`,
+    ].join("\n");
+    
+    try {
+      await fs.writeFile(this.outputPath, output);
+    } catch {
+      // Ignore write errors
+    }
   }
 
-  getOutput(): { stdout: string; stderr: string } {
+  getOutput(): { stdout: string; stderr: string; commands: ProcessEvent[] } {
     return {
       stdout: this.stdoutData,
       stderr: this.stderrData,
+      commands: this.commands,
     };
+  }
+
+  isRunning(): boolean {
+    return this.child ? !this.child.killed : false;
   }
 }
