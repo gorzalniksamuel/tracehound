@@ -27,6 +27,7 @@ export class FilesystemMonitor {
     await this.captureInitialState(rootPath);
 
     // Watch with chokidar - ignore node_modules and .git
+    // Also ignore permission-denied files by using the ignored option
     this.watcher = chokidar.watch(rootPath, {
       ignored: [
         /(^|[\/\\])\../,  // dotfiles
@@ -35,6 +36,9 @@ export class FilesystemMonitor {
         "**/dist/**",
         "**/build/**",
         "**/.tracehound/**",
+        "**/*.key",       // Ignore key files (permission issues)
+        "**/*.pem",       // Ignore cert files
+        "**/*.crt",       // Ignore cert files
       ],
       persistent: true,
       ignoreInitial: true,
@@ -42,50 +46,66 @@ export class FilesystemMonitor {
         stabilityThreshold: 300,
         pollInterval: 100,
       },
+      ignorePermissionErrors: true,  // Ignore EACCES errors
+    });
+
+    // Handle errors silently
+    this.watcher.on("error", (error) => {
+      // Silently ignore permission errors
+      if ((error as any).code === "EACCES") return;
+      console.error("File watcher error:", error);
     });
 
     // Handle add events
     this.watcher.on("add", async (filePath) => {
-      if (this.processedFiles.has(filePath)) return;
-      this.processedFiles.add(filePath);
+      try {
+        if (this.processedFiles.has(filePath)) return;
+        this.processedFiles.add(filePath);
 
-      const relativePath = path.relative(rootPath, filePath);
-      const size = await this.getFileSize(filePath);
-      const hash = await this.getFileHash(filePath);
-      
-      const event: FileEvent = {
-        ts: new Date().toISOString(),
-        type: "file.write",
-        runId,
-        path: relativePath,
-        size,
-        hash,
-      };
+        const relativePath = path.relative(rootPath, filePath);
+        const size = await this.getFileSize(filePath);
+        const hash = await this.getFileHash(filePath);
+        
+        const event: FileEvent = {
+          ts: new Date().toISOString(),
+          type: "file.write",
+          runId,
+          path: relativePath,
+          size,
+          hash,
+        };
 
-      this.eventHandler?.(event);
+        this.eventHandler?.(event);
+      } catch {
+        // Ignore errors for individual files
+      }
     });
 
     // Handle change events
     this.watcher.on("change", async (filePath) => {
-      const relativePath = path.relative(rootPath, filePath);
-      const size = await this.getFileSize(filePath);
-      const hash = await this.getFileHash(filePath);
-      const beforeHash = this.fileHashes.get(filePath);
+      try {
+        const relativePath = path.relative(rootPath, filePath);
+        const size = await this.getFileSize(filePath);
+        const hash = await this.getFileHash(filePath);
+        const beforeHash = this.fileHashes.get(filePath);
 
-      const event: FileEvent = {
-        ts: new Date().toISOString(),
-        type: "file.write",
-        runId,
-        path: relativePath,
-        size,
-        hash_after: hash,
-        hash_before: beforeHash,
-      };
+        const event: FileEvent = {
+          ts: new Date().toISOString(),
+          type: "file.write",
+          runId,
+          path: relativePath,
+          size,
+          hash_after: hash,
+          hash_before: beforeHash,
+        };
 
-      if (hash) {
-        this.fileHashes.set(filePath, hash);
+        if (hash) {
+          this.fileHashes.set(filePath, hash);
+        }
+        this.eventHandler?.(event);
+      } catch {
+        // Ignore errors for individual files
       }
-      this.eventHandler?.(event);
     });
 
     // Handle unlink events
@@ -104,9 +124,13 @@ export class FilesystemMonitor {
       this.eventHandler?.(event);
     });
 
-    // Wait for watcher to be ready
+    // Wait for watcher to be ready (with timeout)
     await new Promise<void>((resolve) => {
-      this.watcher?.on("ready", () => resolve());
+      const timeout = setTimeout(() => resolve(), 5000);  // 5 second timeout
+      this.watcher?.on("ready", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
     });
   }
 
@@ -130,7 +154,7 @@ export class FilesystemMonitor {
             this.fileHashes.set(fullPath, hash);
           }
         } catch {
-          // File might not exist
+          // File might not exist or no permission
         }
       }
     } catch {
