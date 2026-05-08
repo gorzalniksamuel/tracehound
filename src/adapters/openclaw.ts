@@ -5,58 +5,84 @@
 
 import { AgentEvent } from "../types/index.js";
 
+export interface OpenClawSession {
+  sessionKey?: string;
+  taskId?: string;
+  parentAgent?: string;
+  childAgents: Array<{ agent: string; taskId: string }>;
+  chatSource?: string; // telegram, discord, signal, etc.
+}
+
 /**
  * OpenClaw can delegate to coding agents and has structured task metadata.
- * We need to:
- * - Detect delegated coding-agent subprocesses
- * - Split trace by sub-agent/task
- * - Record task metadata from chat triggers
+ * We track:
+ * - Main OpenClaw session
+ * - Delegated coding-agent subprocesses
+ * - Chat source (Discord, Telegram, Signal, WebChat)
+ * - Cross-domain actions (repo + email + calendar)
  */
 export class OpenClawAdapter {
-  private currentTaskId?: string;
-  private currentSessionKey?: string;
-  private agentStack: Array<{ agent: string; taskId: string }> = [];
+  private session: OpenClawSession = {
+    childAgents: [],
+  };
+  private eventLog: AgentEvent[] = [];
 
   /**
-   * Parse OpenClaw output
+   * Parse OpenClaw output for session metadata
    */
   parseOutput(line: string): AgentEvent | null {
-    // Detect OpenClaw session/task
-    const taskMatch = line.match(/OpenClaw\s+Session:\s+([a-zA-Z0-9-_]+)/i);
-    if (taskMatch) {
-      this.currentTaskId = taskMatch[1];
-      this.agentStack.push({ agent: "openclaw", taskId: taskMatch[1] });
-      
+    // Detect OpenClaw session start
+    const sessionMatch = line.match(/OpenClaw.*Session[:\s]+([a-zA-Z0-9-_]+)/i);
+    if (sessionMatch) {
+      this.session.sessionKey = sessionMatch[1];
       return {
         ts: new Date().toISOString(),
         type: "session.start",
         runId: "",
-        sessionId: taskMatch[1],
+        sessionId: sessionMatch[1],
+        agent: "openclaw",
+        source: "openclaw",
+      };
+    }
+
+    // Detect chat source
+    const chatSourceMatch = line.match(/Source:\s*(discord|telegram|signal|webchat|slack)/i);
+    if (chatSourceMatch) {
+      this.session.chatSource = chatSourceMatch[1].toLowerCase();
+      return {
+        ts: new Date().toISOString(),
+        type: "process.exec",
+        runId: "",
+        action: "chat-received",
+        platform: chatSourceMatch[1].toLowerCase(),
         agent: "openclaw",
       };
     }
 
     // Detect coding-agent delegation
-    const delegateMatch = line.match(/(coding-agent|coding_agent|code-agent|code_agent)\s+(\w+)/i);
+    const delegateMatch = line.match(/(coding-agent|coding_agent|code-agent|code_agent).*?using\s+(codex|claude|claude-code|opencode)/i);
     if (delegateMatch) {
-      const subAgent = delegateMatch[2];
-      const delegatedTaskId = `delegated-${Date.now()}`;
+      const subAgent = delegateMatch[2] || delegateMatch[1];
+      const delegatedTaskId = `openclaw-${Date.now()}`;
       
-      this.agentStack.push({ agent: subAgent, taskId: delegatedTaskId });
-      
+      this.session.childAgents.push({
+        agent: subAgent.toLowerCase(),
+        taskId: delegatedTaskId,
+      });
+
       return {
         ts: new Date().toISOString(),
         type: "process.exec",
         runId: "",
         action: "delegate",
         parentAgent: "openclaw",
-        childAgent: subAgent,
+        childAgent: subAgent.toLowerCase(),
         taskId: delegatedTaskId,
       };
     }
 
     // Detect Pi planning
-    const piMatch = line.match(/Pi\s+(?:planned|planning|thinks|analyzing)/i);
+    const piMatch = line.match(/Pi\s+(?:planned|planning|thinks|analyzing|selected plan)/i);
     if (piMatch) {
       return {
         ts: new Date().toISOString(),
@@ -64,43 +90,58 @@ export class OpenClawAdapter {
         runId: "",
         toolName: "pi-plan",
         agent: "pi",
-      };
-    }
-
-    // Detect Codex subprocess
-    const codexSubMatch = line.match(/(codex|claude|opencode)\s+(?:subprocess|spawning|running)/i);
-    if (codexSubMatch) {
-      const agentName = codexSubMatch[1].toLowerCase();
-      return {
-        ts: new Date().toISOString(),
-        type: "process.exec",
-        runId: "",
-        action: "subprocess",
-        agent: agentName,
         parent: "openclaw",
       };
     }
 
-    // Detect Vercel/Netlify deploy
-    const deployMatch = line.match(/(vercel|netlify|deploy)\s+(?:preview|production|deployed)/i);
-    if (deployMatch) {
+    // Detect tool calls
+    const toolCallMatch = line.match(/\[Tool:\s*(\w+)\]/i);
+    if (toolCallMatch) {
       return {
         ts: new Date().toISOString(),
         type: "process.exec",
         runId: "",
-        action: "deploy",
-        platform: deployMatch[1].toLowerCase(),
+        toolName: toolCallMatch[1],
+        agent: "openclaw",
       };
     }
 
-    // Detect GitHub PR creation
-    const prMatch = line.match(/(pr|pull request|opened PR)\s+(?:#?\d+)?/i);
-    if (prMatch) {
+    // Detect web operations
+    const webMatch = line.match(/(web_search|browser_use|web_fetch|fetch_page)\s*[:\-]?\s*(.+)?/i);
+    if (webMatch) {
       return {
         ts: new Date().toISOString(),
-        type: "git.commit",
+        type: "network.http",
         runId: "",
-        action: "pr-created",
+        protocol: "https",
+        action: webMatch[1],
+        query: webMatch[2]?.trim(),
+        agent: "openclaw",
+      };
+    }
+
+    // Detect email/calendar operations
+    const crossDomainMatch = line.match(/(send_email|schedule_meeting|calendar_check|inbox_check)/i);
+    if (crossDomainMatch) {
+      return {
+        ts: new Date().toISOString(),
+        type: "process.exec",
+        runId: "",
+        action: crossDomainMatch[1],
+        crossDomain: true,
+        agent: "openclaw",
+      };
+    }
+
+    // Detect session end
+    const sessionEndMatch = line.match(/OpenClaw.*session.*(ended|complete|finished)/i);
+    if (sessionEndMatch) {
+      return {
+        ts: new Date().toISOString(),
+        type: "session.end",
+        runId: "",
+        sessionId: this.session.sessionKey,
+        agent: "openclaw",
       };
     }
 
@@ -108,10 +149,17 @@ export class OpenClawAdapter {
   }
 
   /**
-   * Get the current agent hierarchy
+   * Get the delegation tree for reporting
    */
-  getAgentTree() {
-    return [...this.agentStack];
+  getDelegationTree(): OpenClawSession {
+    return { ...this.session };
+  }
+
+  /**
+   * Get all logged events
+   */
+  getEvents(): AgentEvent[] {
+    return [...this.eventLog];
   }
 
   /**
@@ -121,10 +169,38 @@ export class OpenClawAdapter {
     return {
       ...metadata,
       openclaw: {
-        taskId: this.currentTaskId,
-        sessionKey: this.currentSessionKey,
-        agentTree: this.getAgentTree(),
+        sessionKey: this.session.sessionKey,
+        chatSource: this.session.chatSource,
+        childAgents: this.session.childAgents,
+        delegationTree: this.session,
       },
     };
   }
+
+  /**
+   * Format delegation tree for display
+   */
+  formatTree(): string {
+    const lines: string[] = [];
+    lines.push("OpenClaw Session");
+    
+    if (this.session.chatSource) {
+      lines.push(`  📱 Source: ${this.session.chatSource}`);
+    }
+    
+    if (this.session.sessionKey) {
+      lines.push(`  🔑 Session: ${this.session.sessionKey}`);
+    }
+    
+    if (this.session.childAgents.length > 0) {
+      lines.push("  🔄 Delegated to:");
+      for (const child of this.session.childAgents) {
+        lines.push(`    - ${child.agent} (${child.taskId})`);
+      }
+    }
+    
+    return lines.join("\n");
+  }
 }
+
+export default OpenClawAdapter;

@@ -13,6 +13,7 @@ import { SecretDetector } from "../recorders/secret-detector.js";
 import { PassiveNetworkMonitor } from "../recorders/network-proxy.js";
 import { PolicyEngine } from "../policies/policy-engine.js";
 import { TraceWriter } from "./trace-writer.js";
+import { OpenClawAdapter } from "../adapters/openclaw.js";
 import { RunManifest, TraceHoundOptions, RunResult, AgentEvent, FileEvent } from "../types/index.js";
 
 export interface TraceHoundConfig extends TraceHoundOptions {
@@ -30,6 +31,7 @@ export class TraceHound extends EventEmitter {
   private policyEngine: PolicyEngine;
   private traceWriter: TraceWriter;
   private events: AgentEvent[] = [];
+  private openclawAdapter?: OpenClawAdapter;
   private warnings: string[] = [];
   private commands: Array<{ ts: string; command: string }> = [];
   private filesModified = 0;
@@ -55,6 +57,11 @@ export class TraceHound extends EventEmitter {
     this.networkMonitor = new PassiveNetworkMonitor();
     this.secretDetector = new SecretDetector();
     this.policyEngine = new PolicyEngine();
+    
+    // Initialize OpenClaw adapter if needed
+    if (options.agent === "openclaw") {
+      this.openclawAdapter = new OpenClawAdapter();
+    }
   }
 
   async run(agentCommand: string): Promise<RunResult> {
@@ -121,6 +128,24 @@ export class TraceHound extends EventEmitter {
         command: `${data.command} ${data.args?.join(" ") || ""}`
       });
     });
+
+    // Parse OpenClaw output if applicable
+    if (this.openclawAdapter) {
+      this.processWrapper.on("stdout", (data: string) => {
+        for (const line of data.split("\n")) {
+          const event = this.openclawAdapter!.parseOutput(line);
+          if (event) {
+            this.events.push(event);
+            this.traceWriter.writeEvent(event);
+            
+            // Log delegation events
+            if (event.action === "delegate") {
+              this.warnings.push(`OpenClaw delegated to ${event.childAgent}`);
+            }
+          }
+        }
+      });
+    }
 
     this.emit("recording-started", { runId: this.config.runId });
   }
@@ -191,6 +216,18 @@ export class TraceHound extends EventEmitter {
       summary,
       warnings: this.warnings,
     };
+    
+    // OpenClaw-specific enrichment
+    if (this.openclawAdapter) {
+      manifest.agentMetadata = {
+        openclaw: this.openclawAdapter.getDelegationTree(),
+        tree: this.openclawAdapter.formatTree(),
+      };
+      
+      // Add formatted tree to warnings for display
+      const tree = this.openclawAdapter.formatTree();
+      this.warnings.unshift(tree);
+    }
     
     // Write manifest
     await this.traceWriter.writeManifest(manifest);

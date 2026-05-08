@@ -44,6 +44,7 @@ export interface RunManifest {
   };
   summary: RunSummary;
   warnings: string[];
+  agentMetadata?: Record<string, unknown>;
 }
 
 export interface GitInfo {
